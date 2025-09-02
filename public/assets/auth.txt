@@ -1,0 +1,1338 @@
+Awesome project idea. Let’s build a clean Django + DRF API that uses:
+- MySQL for Django’s internal tables (sessions, migrations, admin)
+- MongoDB for all your app data (users, tokens, otps, deleted users)
+- Secure OTPs with strict rules (cooldowns, expiration, uniqueness)
+- Token-based auth that supports “logout from all devices,” auto-logout after 10 days of inactivity, and lockouts after wrong passwords
+- Soft delete + restore + admin blacklisting
+
+I’ll walk you through every step like you asked, with code that’s heavily commented so even a beginner can follow along.
+
+----------------------------------------
+What we’re building (features)
+----------------------------------------
+- Signup with unique username/email/phone + role + full name + password + confirm password
+- Send OTP to verify signup
+  - OTP expires after 10 minutes (auto delete via MongoDB TTL)
+  - Resend OTP allowed after 2 minutes (old OTP deleted)
+  - OTP is tied to the user; can’t be used by others
+  - If user stays unverified for 10 minutes, delete the user automatically (via MongoDB TTL)
+- Login/Logout with tokens stored in MongoDB
+  - After 10 wrong password attempts -> lock login for 10 minutes
+  - Logout from current device or all devices
+  - Auto-logout after 10 days of inactivity (no API calls) via MongoDB TTL
+- Forgot password via OTP
+  - OTP is separate from signup OTP and can’t be reused
+  - When password is reset, logout from all devices
+- Delete account (soft delete to a deleted_users collection)
+  - Admin can restore users from deleted
+- Blacklist/unblacklist users (admin-only)
+  - Blacklisted users cannot log in or use existing tokens
+
+We’ll rely on MongoDB TTL indexes to auto-delete OTPs, unverified users, and auto-logout inactive tokens.
+
+----------------------------------------
+Tech stack and why
+----------------------------------------
+- Django + DRF: easy API building and validation
+- PyMongo: talk to MongoDB directly (no ORM complications)
+- MySQL: default Django tables (no app data there)
+- MongoDB TTL indexes: automatic time-based deletions
+- Custom Token Auth: simple tokens stored in Mongo, easy to revoke/expire
+
+----------------------------------------
+Step 0: Install dependencies
+----------------------------------------
+Use a virtual environment (recommended).
+
+- Windows:
+  - py -m venv venv
+  - venv\Scripts\activate
+
+- macOS/Linux:
+  - python3 -m venv venv
+  - source venv/bin/activate
+
+Install packages:
+- pip install django djangorestframework pymongo python-dotenv mysqlclient
+
+----------------------------------------
+Step 1: Create project and app
+----------------------------------------
+- django-admin startproject core
+- cd core
+- python manage.py startapp accounts
+
+Your project structure will look like:
+- core/
+  - core/
+    - settings.py
+    - urls.py
+    - asgi.py
+    - wsgi.py
+  - accounts/
+    - apps.py
+    - urls.py
+    - views.py
+    - authentication.py
+    - serializers.py
+    - repositories.py
+    - mongo.py
+    - indexes.py
+    - utils/
+      - security.py
+      - otp.py
+      - senders.py
+  - manage.py
+- .env (you create)
+
+----------------------------------------
+Step 2: Environment variables (.env)
+----------------------------------------
+Create a .env file in the root (same level as manage.py):
+- SECRET_KEY=your-django-secret-key
+- DEBUG=True
+- ALLOWED_HOSTS=*
+- MYSQL_NAME=your_db_name
+- MYSQL_USER=your_user
+- MYSQL_PASSWORD=your_password
+- MYSQL_HOST=127.0.0.1
+- MYSQL_PORT=3306
+- MONGO_URI=mongodb://localhost:27017
+- MONGO_DB_NAME=myappdb
+- OTP_LENGTH=6
+- OTP_COOLDOWN_SECONDS=120
+- OTP_TTL_SECONDS=600
+- TOKEN_INACTIVITY_TTL_SECONDS=864000
+- LOGIN_LOCK_MINUTES=10
+- MAX_FAILED_LOGINS=10
+
+Note: You’ll put your actual Mongo connection string (Atlas or local) in MONGO_URI.
+
+----------------------------------------
+Step 3: settings.py (configure Django + DRF + MySQL + load .env)
+----------------------------------------
+Replace core/settings.py with this (edit DB values to match yours):
+
+```python
+# core/core/settings.py
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
+DEBUG = os.getenv("DEBUG", "True") == "True"
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "*").split(",")
+
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",   # Needed for hashers and admin
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "rest_framework",
+    "accounts",
+]
+
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",  # DRF doesn’t need sessions, but Django admin does
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",  # For browsable API; for pure APIs you can disable CSRF on views
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
+ROOT_URLCONF = "core.urls"
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {"context_processors": [
+            "django.template.context_processors.debug",
+            "django.template.context_processors.request",
+            "django.contrib.auth.context_processors.auth",
+            "django.contrib.messages.context_processors.messages",
+        ]},
+    },
+]
+WSGI_APPLICATION = "core.wsgi.application"
+
+# MySQL for Django internal use (not for app data)
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.mysql",
+        "NAME": os.getenv("MYSQL_NAME"),
+        "USER": os.getenv("MYSQL_USER"),
+        "PASSWORD": os.getenv("MYSQL_PASSWORD"),
+        "HOST": os.getenv("MYSQL_HOST", "127.0.0.1"),
+        "PORT": os.getenv("MYSQL_PORT", "3306"),
+        "OPTIONS": {"charset": "utf8mb4"},
+    }
+}
+
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "UTC"
+USE_I18N = True
+USE_TZ = True
+
+STATIC_URL = "static/"
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# DRF: use our custom Mongo token authentication
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "accounts.authentication.MongoTokenAuthentication",
+    ]
+}
+
+# Our Mongo config passed to the app
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "myappdb")
+
+# App-level constants (fallbacks if .env missing)
+OTP_LENGTH = int(os.getenv("OTP_LENGTH", "6"))
+OTP_COOLDOWN_SECONDS = int(os.getenv("OTP_COOLDOWN_SECONDS", "120"))
+OTP_TTL_SECONDS = int(os.getenv("OTP_TTL_SECONDS", "600"))
+TOKEN_INACTIVITY_TTL_SECONDS = int(os.getenv("TOKEN_INACTIVITY_TTL_SECONDS", "864000"))  # 10 days
+LOGIN_LOCK_MINUTES = int(os.getenv("LOGIN_LOCK_MINUTES", "10"))
+MAX_FAILED_LOGINS = int(os.getenv("MAX_FAILED_LOGINS", "10"))
+```
+
+Why this matters:
+- We still use Django’s auth system ONLY for hashing and admin (no users in MySQL).
+- All our business data (users, tokens, otps) lives in Mongo via PyMongo.
+- DRF uses our custom auth class to check tokens in Mongo.
+
+Run Django internal migrations:
+- python manage.py migrate
+
+----------------------------------------
+Step 4: accounts/apps.py (init + ensure indexes)
+----------------------------------------
+```python
+# core/accounts/apps.py
+from django.apps import AppConfig
+
+class AccountsConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "accounts"
+
+    def ready(self):
+        # When the app starts, ensure MongoDB indexes exist.
+        from .indexes import ensure_mongo_indexes
+        ensure_mongo_indexes()
+```
+
+What this does:
+- Automatically creates indexes in MongoDB when Django starts (unique constraints + TTLs).
+
+----------------------------------------
+Step 5: Mongo connection + collections (accounts/mongo.py)
+----------------------------------------
+```python
+# core/accounts/mongo.py
+from django.conf import settings
+from pymongo import MongoClient
+
+# Create a global Mongo client once
+_client = MongoClient(settings.MONGO_URI)
+db = _client[settings.MONGO_DB_NAME]
+
+# Our collections (like tables)
+users_col = db["users"]
+otps_col = db["otps"]
+tokens_col = db["tokens"]
+deleted_users_col = db["deleted_users"]
+```
+
+Simple and clear: these are your tables.
+
+----------------------------------------
+Step 6: Indexes (unique + TTL) (accounts/indexes.py)
+----------------------------------------
+```python
+# core/accounts/indexes.py
+from datetime import timedelta
+from pymongo import ASCENDING
+from django.conf import settings
+from .mongo import users_col, otps_col, tokens_col, deleted_users_col
+
+def ensure_mongo_indexes():
+    # USERS
+    # Unique constraints so duplicates can't be inserted
+    users_col.create_index([("username", ASCENDING)], unique=True, name="uniq_username")
+    users_col.create_index([("email", ASCENDING)], unique=True, name="uniq_email")
+    users_col.create_index([("phone", ASCENDING)], unique=True, name="uniq_phone")
+
+    # TTL to delete UNVERIFIED users after 10 minutes:
+    # We set a field "delete_at" only for unverified users; when verified, we unset it.
+    # expireAfterSeconds=0 means delete exactly at the time in delete_at.
+    users_col.create_index([("delete_at", ASCENDING)], expireAfterSeconds=0, name="ttl_unverified_delete")
+
+    # OTPS
+    # Ensure one OTP per user per type (signup or password_reset)
+    otps_col.create_index([("user_id", ASCENDING), ("otp_type", ASCENDING)], unique=True, name="uniq_user_type")
+    # Auto-delete OTPs after OTP_TTL_SECONDS (e.g., 600 seconds = 10 minutes)
+    otps_col.create_index([("created_at", ASCENDING)], expireAfterSeconds=settings.OTP_TTL_SECONDS, name="ttl_otp")
+
+    # TOKENS
+    # Token strings must be unique
+    tokens_col.create_index([("token", ASCENDING)], unique=True, name="uniq_token")
+    # Auto-delete tokens after X seconds of no activity (we update last_activity on every request)
+    tokens_col.create_index([("last_activity", ASCENDING)], expireAfterSeconds=settings.TOKEN_INACTIVITY_TTL_SECONDS, name="ttl_token_inactivity")
+
+    # DELETED_USERS: no special index required, but you could add on username/email/phone for admin lookups
+```
+
+Why TTL is magic:
+- You don’t need a cron job to delete OTPs/tokens/unverified users. Mongo does it for you!
+
+----------------------------------------
+Step 7: Utils – security (hash passwords, tokens) (accounts/utils/security.py)
+----------------------------------------
+```python
+# core/accounts/utils/security.py
+import secrets
+import hmac
+import hashlib
+from django.contrib.auth.hashers import make_password, check_password
+from django.conf import settings
+
+def hash_password(raw_password: str) -> str:
+    # Uses Django's secure password hashing (PBKDF2 by default)
+    return make_password(raw_password)
+
+def verify_password(raw_password: str, hashed_password: str) -> bool:
+    return check_password(raw_password, hashed_password)
+
+def generate_token() -> str:
+    # A random, URL-safe token string. Treat it like a password.
+    return secrets.token_urlsafe(32)
+
+def hash_otp(code: str) -> str:
+    # We hash OTP with HMAC-SHA256 so even if DB is leaked, OTPs aren't readable
+    secret = settings.SECRET_KEY.encode("utf-8")
+    return hmac.new(secret, code.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def constant_time_compare(a: str, b: str) -> bool:
+    # Compare in constant time to avoid timing attacks
+    return hmac.compare_digest(a, b)
+```
+
+----------------------------------------
+Step 8: Utils – OTP generator + sender stubs (accounts/utils/otp.py, senders.py)
+----------------------------------------
+```python
+# core/accounts/utils/otp.py
+import random
+from django.conf import settings
+
+def generate_otp(length: int = None) -> str:
+    # Example: "123456" (always numeric, easier for users)
+    length = length or settings.OTP_LENGTH
+    return "".join(str(random.randint(0, 9)) for _ in range(length))
+```
+
+```python
+# core/accounts/utils/senders.py
+# These are simple placeholders. Replace with real email/SMS providers in production.
+
+def send_email(to_email: str, subject: str, body: str):
+    # Replace with: SendGrid / SES / SMTP
+    print(f"[EMAIL to {to_email}] {subject}\n{body}")
+
+def send_sms(to_phone: str, body: str):
+    # Replace with: Twilio / other SMS provider
+    print(f"[SMS to {to_phone}] {body}")
+```
+
+Note: In real apps, NEVER print OTPs in logs. Use real providers.
+
+----------------------------------------
+Step 9: Data access (repositories.py) — one place to talk to Mongo
+----------------------------------------
+This file is the “brain” for CRUD on our collections.
+
+```python
+# core/accounts/repositories.py
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
+from django.conf import settings
+from .mongo import users_col, otps_col, tokens_col, deleted_users_col
+from .utils.security import hash_password, verify_password, hash_otp
+from .utils.security import generate_token as generate_session_token
+
+def now_utc():
+    return datetime.utcnow()
+
+def to_object_id(_id: str) -> ObjectId:
+    return ObjectId(_id)
+
+# ---------- Users ----------
+def create_user(user_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Inserts a new user into Mongo 'users' collection.
+    user_data must include: username, email, phone, full_name, role, password (raw)
+    """
+    doc = {
+        "username": user_data["username"].strip(),
+        "email": user_data["email"].strip().lower(),
+        "phone": user_data["phone"].strip(),
+        "full_name": user_data["full_name"].strip(),
+        "role": user_data.get("role", "user"),
+        "password_hash": hash_password(user_data["password"]),
+        "is_verified": False,
+        "is_blacklisted": False,
+        "failed_login_count": 0,
+        "lock_until": None,
+        "created_at": now_utc(),
+        "updated_at": now_utc(),
+        # For unverified users, set a delete_at in 10 minutes: Mongo TTL will delete them if they never verify.
+        "delete_at": now_utc() + timedelta(seconds=settings.OTP_TTL_SECONDS),
+    }
+    try:
+        result = users_col.insert_one(doc)
+        doc["_id"] = result.inserted_id
+        return doc
+    except DuplicateKeyError as e:
+        # Unique index violation (username/email/phone)
+        raise ValueError("Username, email, or phone already exists") from e
+
+def find_user_by_identifier(identifier: str) -> Optional[Dict[str, Any]]:
+    """
+    Allows login/lookup by username OR email OR phone.
+    Very simple detection: if contains '@' => email, if digits => phone, else => username.
+    """
+    ident = identifier.strip()
+    query = None
+    if "@" in ident:
+        query = {"email": ident.lower()}
+    elif ident.isdigit():
+        query = {"phone": ident}
+    else:
+        query = {"username": ident}
+    return users_col.find_one(query)
+
+def find_user_by_id(user_id: ObjectId) -> Optional[Dict[str, Any]]:
+    return users_col.find_one({"_id": user_id})
+
+def mark_user_verified(user_id: ObjectId):
+    # Verified users should not be auto-deleted, so unset delete_at
+    users_col.update_one({"_id": user_id}, {"$set": {"is_verified": True, "updated_at": now_utc()},
+                                            "$unset": {"delete_at": ""}})
+
+def set_user_lock(user_id: ObjectId, minutes: int):
+    users_col.update_one({"_id": user_id}, {"$set": {"lock_until": now_utc() + timedelta(minutes=minutes), "failed_login_count": 0}})
+
+def reset_failed_logins(user_id: ObjectId):
+    users_col.update_one({"_id": user_id}, {"$set": {"failed_login_count": 0}})
+
+def increment_failed_logins(user_id: ObjectId) -> int:
+    # Atomically increment and return the new count
+    updated = users_col.find_one_and_update(
+        {"_id": user_id},
+        {"$inc": {"failed_login_count": 1}},
+        return_document=True
+    )
+    return updated["failed_login_count"]
+
+def update_password(user_id: ObjectId, new_password: str):
+    users_col.update_one({"_id": user_id}, {"$set": {"password_hash": hash_password(new_password), "updated_at": now_utc()}})
+
+def is_user_blacklisted(user_doc: Dict[str, Any]) -> bool:
+    return user_doc.get("is_blacklisted", False)
+
+def set_blacklist(user_id: ObjectId, value: bool):
+    users_col.update_one({"_id": user_id}, {"$set": {"is_blacklisted": value, "updated_at": now_utc()}})
+
+def refresh_unverified_delete_timer(user_id: ObjectId):
+    # When resending signup OTP, give them another 10 minutes or OTP_TTL_SECONDS
+    users_col.update_one({"_id": user_id}, {"$set": {"delete_at": now_utc() + timedelta(seconds=settings.OTP_TTL_SECONDS)}})
+
+def move_user_to_deleted(user_doc: Dict[str, Any]):
+    # Insert into deleted_users then remove from users; also add deleted_at timestamp
+    doc = dict(user_doc)
+    doc["deleted_at"] = now_utc()
+    deleted_users_col.insert_one(doc)
+    users_col.delete_one({"_id": user_doc["_id"]})
+
+def restore_deleted_user_by_identifier(identifier: str) -> Dict[str, Any]:
+    # Try to find in deleted_users by username/email/phone and move back to users.
+    ident = identifier.strip()
+    if "@" in ident:
+        query = {"email": ident.lower()}
+    elif ident.isdigit():
+        query = {"phone": ident}
+    else:
+        query = {"username": ident}
+
+    doc = deleted_users_col.find_one(query)
+    if not doc:
+        raise ValueError("Deleted user not found")
+
+    # Remove fields that should not conflict or re-create
+    doc.pop("_id")        # new _id will be created
+    doc.pop("deleted_at", None)
+
+    # Try to insert back; if unique conflicts exist, it will fail
+    from pymongo.errors import DuplicateKeyError
+    try:
+        users_col.insert_one(doc)
+    except DuplicateKeyError:
+        raise ValueError("Cannot restore: username/email/phone already taken by another user")
+
+    # Remove from deleted_users
+    deleted_users_col.delete_one(query)
+    return doc
+
+# ---------- OTPs ----------
+def get_user_otp(user_id: ObjectId, otp_type: str) -> Optional[Dict[str, Any]]:
+    return otps_col.find_one({"user_id": user_id, "otp_type": otp_type})
+
+def delete_user_otp(user_id: ObjectId, otp_type: str):
+    otps_col.delete_one({"user_id": user_id, "otp_type": otp_type})
+
+def create_or_replace_otp(user_id: ObjectId, otp_type: str, code_plain: str, sent_via: str) -> Dict[str, Any]:
+    # Ensure only one OTP exists per user per type: delete old and insert new
+    delete_user_otp(user_id, otp_type)
+    doc = {
+        "user_id": user_id,
+        "otp_type": otp_type,  # "signup" or "password_reset"
+        "code_hash": hash_otp(code_plain),
+        "created_at": now_utc(),
+        "sent_via": sent_via,
+    }
+    otps_col.insert_one(doc)
+    return doc
+
+# ---------- Tokens ----------
+def create_token(user_id: ObjectId, ip: str, user_agent: str) -> Dict[str, Any]:
+    token_str = generate_session_token()
+    doc = {
+        "user_id": user_id,
+        "token": token_str,
+        "ip": ip,
+        "user_agent": user_agent,
+        "issued_at": now_utc(),
+        "last_activity": now_utc(),  # TTL refreshes when this timestamp updates
+        "revoked": False,            # Not used here; we delete tokens instead of setting revoked
+    }
+    tokens_col.insert_one(doc)
+    return doc
+
+def update_token_last_activity(token_str: str):
+    tokens_col.update_one({"token": token_str}, {"$set": {"last_activity": now_utc()}})
+
+def find_token(token_str: str) -> Optional[Dict[str, Any]]:
+    return tokens_col.find_one({"token": token_str})
+
+def delete_token(token_str: str):
+    tokens_col.delete_one({"token": token_str})
+
+def delete_all_tokens_for_user(user_id: ObjectId):
+    tokens_col.delete_many({"user_id": user_id})
+```
+
+----------------------------------------
+Step 10: Serializers (validate inputs) (accounts/serializers.py)
+----------------------------------------
+```python
+# core/accounts/serializers.py
+from rest_framework import serializers
+
+class SignupSerializer(serializers.Serializer):
+    username = serializers.CharField(min_length=3, max_length=50)
+    email = serializers.EmailField()
+    phone = serializers.CharField(min_length=6, max_length=20)
+    full_name = serializers.CharField(min_length=1, max_length=100)
+    role = serializers.ChoiceField(choices=["user", "admin"], default="user")
+    password = serializers.CharField(min_length=8, write_only=True)
+    confirm_password = serializers.CharField(min_length=8, write_only=True)
+
+    def validate(self, attrs):
+        if attrs["password"] != attrs["confirm_password"]:
+            raise serializers.ValidationError("Passwords do not match")
+        return attrs
+
+class IdentifierSerializer(serializers.Serializer):
+    # For endpoints that accept username OR email OR phone
+    identifier = serializers.CharField()
+
+class VerifyOtpSerializer(serializers.Serializer):
+    identifier = serializers.CharField()
+    otp = serializers.CharField(min_length=4, max_length=12)
+
+class LoginSerializer(serializers.Serializer):
+    identifier = serializers.CharField()
+    password = serializers.CharField(write_only=True)
+
+class ResetPasswordWithOtpSerializer(serializers.Serializer):
+    identifier = serializers.CharField()
+    otp = serializers.CharField()
+    new_password = serializers.CharField(min_length=8, write_only=True)
+    confirm_password = serializers.CharField(min_length=8, write_only=True)
+
+    def validate(self, attrs):
+        if attrs["new_password"] != attrs["confirm_password"]:
+            raise serializers.ValidationError("Passwords do not match")
+        return attrs
+
+class AdminActionSerializer(serializers.Serializer):
+    identifier = serializers.CharField()
+    reason = serializers.CharField(required=False, allow_blank=True)
+```
+
+----------------------------------------
+Step 11: Authentication class (accounts/authentication.py)
+----------------------------------------
+This reads the token from Authorization header, looks it up in Mongo, checks the user, and updates last_activity so TTL won’t delete active tokens.
+
+```python
+# core/accounts/authentication.py
+from typing import Optional, Tuple
+from rest_framework.authentication import BaseAuthentication, get_authorization_header
+from rest_framework.exceptions import AuthenticationFailed
+from django.utils.translation import gettext_lazy as _
+from .repositories import find_token, find_user_by_id, update_token_last_activity, is_user_blacklisted
+from bson import ObjectId
+
+class MongoUser:
+    """
+    A tiny user wrapper so DRF sees request.user as authenticated.
+    """
+    def __init__(self, user_doc):
+        self.id = str(user_doc["_id"])
+        self.username = user_doc["username"]
+        self.email = user_doc["email"]
+        self.phone = user_doc["phone"]
+        self.role = user_doc.get("role", "user")
+        self.is_verified = user_doc.get("is_verified", False)
+        self.is_blacklisted = user_doc.get("is_blacklisted", False)
+
+    @property
+    def is_authenticated(self):
+        return True
+
+    def is_admin(self):
+        return self.role == "admin"
+
+class MongoTokenAuthentication(BaseAuthentication):
+    keyword = "Bearer"
+
+    def authenticate(self, request) -> Optional[Tuple[MongoUser, str]]:
+        auth = get_authorization_header(request).split()
+
+        if not auth or auth[0].lower() != self.keyword.lower().encode():
+            return None  # No auth header; DRF will treat as anonymous, unless view requires auth
+
+        if len(auth) == 1:
+            raise AuthenticationFailed(_("Invalid token header. No credentials provided."))
+        elif len(auth) > 2:
+            raise AuthenticationFailed(_("Invalid token header. Token string should not contain spaces."))
+
+        token_str = auth[1].decode()
+        token_doc = find_token(token_str)
+        if not token_doc:
+            raise AuthenticationFailed(_("Invalid or expired token"))
+
+        user_doc = find_user_by_id(token_doc["user_id"])
+        if not user_doc:
+            raise AuthenticationFailed(_("User not found"))
+
+        if not user_doc.get("is_verified", False):
+            raise AuthenticationFailed(_("User not verified"))
+
+        if is_user_blacklisted(user_doc):
+            raise AuthenticationFailed(_("User is blacklisted"))
+
+        # Update last_activity to keep token alive
+        update_token_last_activity(token_str)
+
+        return (MongoUser(user_doc), token_str)
+```
+
+----------------------------------------
+Step 12: Views (endpoints logic) (accounts/views.py)
+----------------------------------------
+Each view is thoroughly commented to explain what it’s doing and why.
+
+```python
+# core/accounts/views.py
+from datetime import datetime, timedelta
+from django.conf import settings
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status, permissions
+
+from .serializers import (
+    SignupSerializer, IdentifierSerializer, VerifyOtpSerializer,
+    LoginSerializer, ResetPasswordWithOtpSerializer, AdminActionSerializer
+)
+from .repositories import (
+    create_user, find_user_by_identifier, mark_user_verified,
+    get_user_otp, create_or_replace_otp, delete_user_otp,
+    create_token, delete_token, delete_all_tokens_for_user,
+    update_password, increment_failed_logins, reset_failed_logins,
+    set_user_lock, refresh_unverified_delete_timer, move_user_to_deleted,
+    restore_deleted_user_by_identifier, set_blacklist
+)
+from .utils.otp import generate_otp
+from .utils.security import constant_time_compare
+from .utils.senders import send_email, send_sms
+
+def client_ip(request):
+    return request.META.get("REMOTE_ADDR", "")
+
+def user_agent(request):
+    return request.META.get("HTTP_USER_AGENT", "")
+
+class SignupView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        """
+        Create a new user (unverified), send signup OTP, and set auto-delete in 10 minutes.
+        """
+        ser = SignupSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response({"errors": ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = ser.validated_data
+        try:
+            user_doc = create_user(data)
+        except ValueError as e:
+            return Response({"message": str(e)}, status=status.HTTP_409_CONFLICT)
+
+        # Generate OTP and send (by email OR sms; here we’ll prefer email if available)
+        otp_code = generate_otp()
+        sent_via = "email" if user_doc["email"] else "sms"
+
+        create_or_replace_otp(user_doc["_id"], "signup", otp_code, sent_via)
+
+        # Usually you'd send only ONE medium; here we demo email if present; else SMS
+        if sent_via == "email":
+            send_email(user_doc["email"], "Your Signup OTP", f"Your OTP is: {otp_code}")
+        else:
+            send_sms(user_doc["phone"], f"Your OTP is: {otp_code}")
+
+        return Response({
+            "message": "Signup successful. OTP sent. Verify within 10 minutes.",
+            "note": "If you don't verify within 10 minutes, your account will be deleted automatically."
+        }, status=status.HTTP_201_CREATED)
+
+class ResendSignupOtpView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        """
+        Resend signup OTP after a 2-minute cooldown. Old OTP is deleted.
+        Also refreshes the user's unverified delete timer.
+        """
+        ser = IdentifierSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response({"errors": ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_doc = find_user_by_identifier(ser.validated_data["identifier"])
+        if not user_doc:
+            return Response({"message": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if user_doc.get("is_verified", False):
+            return Response({"message": "User already verified"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check cooldown (2 minutes since last OTP)
+        otp_doc = get_user_otp(user_doc["_id"], "signup")
+        if otp_doc:
+            age_seconds = (datetime.utcnow() - otp_doc["created_at"]).total_seconds()
+            if age_seconds < settings.OTP_COOLDOWN_SECONDS:
+                wait = int(settings.OTP_COOLDOWN_SECONDS - age_seconds)
+                return Response({"message": f"Please wait {wait} more seconds before requesting a new OTP."},
+                                status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # Create new OTP (delete old automatically in repo), refresh delete timer
+        otp_code = generate_otp()
+        create_or_replace_otp(user_doc["_id"], "signup", otp_code, "email" if user_doc.get("email") else "sms")
+        refresh_unverified_delete_timer(user_doc["_id"])
+
+        if user_doc.get("email"):
+            send_email(user_doc["email"], "Your Signup OTP", f"Your OTP is: {otp_code}")
+        else:
+            send_sms(user_doc["phone"], f"Your OTP is: {otp_code}")
+
+        return Response({"message": "New OTP sent. Verify within 10 minutes."})
+
+class VerifySignupOtpView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        """
+        Verify the signup OTP. If correct, mark user as verified and delete the OTP instantly.
+        """
+        ser = VerifyOtpSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response({"errors": ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_doc = find_user_by_identifier(ser.validated_data["identifier"])
+        if not user_doc:
+            return Response({"message": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if user_doc.get("is_verified", False):
+            return Response({"message": "User already verified"}, status=status.HTTP_400_BAD_REQUEST)
+
+        otp_doc = get_user_otp(user_doc["_id"], "signup")
+        if not otp_doc:
+            # Could be expired (auto-deleted after 10 min)
+            return Response({"message": "OTP not found or expired"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check OTP
+        from .utils.security import hash_otp
+        provided_hash = hash_otp(ser.validated_data["otp"])
+        if not constant_time_compare(provided_hash, otp_doc["code_hash"]):
+            return Response({"message": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Success: mark verified, delete OTP immediately
+        mark_user_verified(user_doc["_id"])
+        delete_user_otp(user_doc["_id"], "signup")
+
+        return Response({"message": "Signup verified. You can now log in."})
+
+class LoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        """
+        Log in with username/email/phone and password.
+        - Must be verified and not blacklisted
+        - Locks after too many failed attempts
+        - Returns a token used in Authorization: Bearer <token>
+        """
+        ser = LoginSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response({"errors": ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_doc = find_user_by_identifier(ser.validated_data["identifier"])
+        if not user_doc:
+            return Response({"message": "Invalid credentials"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Must be verified
+        if not user_doc.get("is_verified", False):
+            return Response({"message": "User is not verified"}, status=status.HTTP_403_FORBIDDEN)
+
+        # Lockout check
+        lock_until = user_doc.get("lock_until")
+        if lock_until and lock_until > datetime.utcnow():
+            delta = int((lock_until - datetime.utcnow()).total_seconds())
+            return Response({"message": f"Account locked. Try again in {delta} seconds."}, status=status.HTTP_403_FORBIDDEN)
+
+        # Check password
+        from .utils.security import verify_password
+        if not verify_password(ser.validated_data["password"], user_doc["password_hash"]):
+            new_count = increment_failed_logins(user_doc["_id"])
+            if new_count >= settings.MAX_FAILED_LOGINS:
+                set_user_lock(user_doc["_id"], settings.LOGIN_LOCK_MINUTES)
+                return Response({"message": "Too many wrong attempts. Account locked for 10 minutes."}, status=status.HTTP_403_FORBIDDEN)
+            return Response({"message": "Invalid credentials"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Success: reset failed count, issue token
+        reset_failed_logins(user_doc["_id"])
+        tok = create_token(user_doc["_id"], client_ip(request), user_agent(request))
+        return Response({
+            "message": "Login successful",
+            "token": tok["token"],
+            "inactivity_logout_seconds": settings.TOKEN_INACTIVITY_TTL_SECONDS
+        })
+
+class LogoutView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """
+        Logout current device: delete current token only.
+        """
+        token_str = request.auth  # set by our authentication class
+        delete_token(token_str)
+        return Response({"message": "Logged out"})
+
+class LogoutAllView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """
+        Logout from ALL devices: delete all tokens for this user.
+        """
+        from bson import ObjectId
+        user_id = ObjectId(request.user.id)
+        delete_all_tokens_for_user(user_id)
+        return Response({"message": "Logged out from all devices"})
+
+class ForgotPasswordRequestOtpView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        """
+        Request a password reset OTP. Requires verified user.
+        Cooldown 2 minutes. OTP expires in 10 minutes automatically.
+        """
+        ser = IdentifierSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response({"errors": ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_doc = find_user_by_identifier(ser.validated_data["identifier"])
+        if not user_doc:
+            return Response({"message": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not user_doc.get("is_verified", False):
+            return Response({"message": "User not verified"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Cooldown for password_reset OTP (same logic as signup)
+        otp_doc = get_user_otp(user_doc["_id"], "password_reset")
+        if otp_doc:
+            age_seconds = (datetime.utcnow() - otp_doc["created_at"]).total_seconds()
+            if age_seconds < settings.OTP_COOLDOWN_SECONDS:
+                wait = int(settings.OTP_COOLDOWN_SECONDS - age_seconds)
+                return Response({"message": f"Please wait {wait} more seconds before requesting a new OTP."},
+                                status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # Create new OTP and send
+        otp_code = generate_otp()
+        create_or_replace_otp(user_doc["_id"], "password_reset", otp_code, "email" if user_doc.get("email") else "sms")
+        if user_doc.get("email"):
+            send_email(user_doc["email"], "Your Password Reset OTP", f"Your OTP is: {otp_code}")
+        else:
+            send_sms(user_doc["phone"], f"Your password reset OTP is: {otp_code}")
+
+        return Response({"message": "Password reset OTP sent. Valid for 10 minutes."})
+
+class VerifyOtpAndResetPasswordView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        """
+        Verify password reset OTP and set a new password.
+        After resetting, log out from all devices.
+        """
+        ser = ResetPasswordWithOtpSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response({"errors": ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        identifier = ser.validated_data["identifier"]
+        otp = ser.validated_data["otp"]
+        new_password = ser.validated_data["new_password"]
+
+        user_doc = find_user_by_identifier(identifier)
+        if not user_doc:
+            return Response({"message": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Must be verified
+        if not user_doc.get("is_verified", False):
+            return Response({"message": "User not verified"}, status=status.HTTP_400_BAD_REQUEST)
+
+        otp_doc = get_user_otp(user_doc["_id"], "password_reset")
+        if not otp_doc:
+            return Response({"message": "OTP not found or expired"}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .utils.security import hash_otp, constant_time_compare
+        if not constant_time_compare(hash_otp(otp), otp_doc["code_hash"]):
+            return Response({"message": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Success: delete OTP, update password, logout all devices
+        delete_user_otp(user_doc["_id"], "password_reset")
+        update_password(user_doc["_id"], new_password)
+        delete_all_tokens_for_user(user_doc["_id"])
+
+        return Response({"message": "Password changed. You have been logged out on all devices."})
+
+class DeleteAccountView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request):
+        """
+        Soft-delete your own account: move to deleted_users and remove from users.
+        Tokens are also deleted.
+        """
+        from bson import ObjectId
+        user_id = ObjectId(request.user.id)
+
+        # We need the full user doc; simple re-fetch
+        from .repositories import find_user_by_id
+        user_doc = find_user_by_id(user_id)
+        if not user_doc:
+            return Response({"message": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not user_doc.get("is_verified", False):
+            return Response({"message": "Only verified users can be deleted"}, status=status.HTTP_400_BAD_REQUEST)
+
+        move_user_to_deleted(user_doc)
+        delete_all_tokens_for_user(user_id)
+
+        return Response({"message": "Account deleted. Admin can restore it later if needed."})
+
+# Admin-only endpoints
+class IsAdmin(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and getattr(request.user, "is_authenticated", False) and request.user.is_admin())
+
+class AdminRestoreUserView(APIView):
+    permission_classes = [IsAdmin]
+
+    def post(self, request):
+        """
+        Restore a user from deleted_users by identifier (username/email/phone).
+        Fails if usernames/emails/phones conflict with existing users.
+        """
+        ser = IdentifierSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response({"errors": ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            restored_doc = restore_deleted_user_by_identifier(ser.validated_data["identifier"])
+            return Response({"message": "User restored"})
+        except ValueError as e:
+            return Response({"message": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+class AdminBlacklistUserView(APIView):
+    permission_classes = [IsAdmin]
+
+    def post(self, request):
+        """
+        Blacklist a user by identifier (username/email/phone). This logs them out from all devices.
+        """
+        ser = AdminActionSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response({"errors": ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        identifier = ser.validated_data["identifier"]
+        user_doc = find_user_by_identifier(identifier)
+        if not user_doc:
+            return Response({"message": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        set_blacklist(user_doc["_id"], True)
+        delete_all_tokens_for_user(user_doc["_id"])
+        return Response({"message": f"User {user_doc['username']} blacklisted"})
+
+class AdminUnblacklistUserView(APIView):
+    permission_classes = [IsAdmin]
+
+    def post(self, request):
+        """
+        Remove a user from blacklist.
+        """
+        ser = IdentifierSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response({"errors": ser.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_doc = find_user_by_identifier(ser.validated_data["identifier"])
+        if not user_doc:
+            return Response({"message": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        set_blacklist(user_doc["_id"], False)
+        return Response({"message": f"User {user_doc['username']} removed from blacklist"})
+
+class MeView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        """
+        A simple endpoint to test auth and see who you are.
+        Also keeps your token alive by updating last_activity in auth class.
+        """
+        return Response({
+            "id": request.user.id,
+            "username": request.user.username,
+            "email": request.user.email,
+            "phone": request.user.phone,
+            "role": request.user.role,
+            "is_verified": request.user.is_verified,
+        })
+```
+
+----------------------------------------
+Step 13: URLs (accounts/urls.py, core/urls.py)
+----------------------------------------
+```python
+# core/accounts/urls.py
+from django.urls import path
+from .views import (
+    SignupView, ResendSignupOtpView, VerifySignupOtpView,
+    LoginView, LogoutView, LogoutAllView,
+    ForgotPasswordRequestOtpView, VerifyOtpAndResetPasswordView,
+    DeleteAccountView,
+    AdminRestoreUserView, AdminBlacklistUserView, AdminUnblacklistUserView,
+    MeView
+)
+
+urlpatterns = [
+    path("auth/signup", SignupView.as_view()),
+    path("auth/signup/resend-otp", ResendSignupOtpView.as_view()),
+    path("auth/signup/verify-otp", VerifySignupOtpView.as_view()),
+
+    path("auth/login", LoginView.as_view()),
+    path("auth/logout", LogoutView.as_view()),
+    path("auth/logout-all", LogoutAllView.as_view()),
+
+    path("auth/forgot-password/request-otp", ForgotPasswordRequestOtpView.as_view()),
+    path("auth/forgot-password/verify-and-reset", VerifyOtpAndResetPasswordView.as_view()),
+
+    path("user", DeleteAccountView.as_view()),  # DELETE
+
+    path("admin/users/restore", AdminRestoreUserView.as_view()),
+    path("admin/users/blacklist", AdminBlacklistUserView.as_view()),
+    path("admin/users/unblacklist", AdminUnblacklistUserView.as_view()),
+
+    path("me", MeView.as_view()),
+]
+```
+
+```python
+# core/core/urls.py
+from django.contrib import admin
+from django.urls import path, include
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("api/", include("accounts.urls")),
+]
+```
+
+----------------------------------------
+How it all works together (plain English)
+----------------------------------------
+- When someone signs up:
+  - We create a user in Mongo with is_verified = false and set delete_at = now + 10 minutes.
+  - We create an OTP record tied to that user and send it by email or SMS.
+  - Mongo DB will automatically delete the user after 10 minutes if they never verify (TTL on users.delete_at).
+  - The OTP also auto-deletes after 10 minutes (TTL on otps.created_at).
+  - If they ask for a new OTP, we check they waited 2 minutes before sending a fresh one. We delete the old OTP and refresh delete_at to give them another 10 minutes.
+  - When they verify OTP, we mark them verified and remove delete_at, so Mongo won’t delete them.
+
+- Login:
+  - Only verified, not-blacklisted users can log in.
+  - If they fail 10 times, we lock them for 10 minutes.
+  - If they succeed, we create a token stored in Mongo with last_activity=now.
+  - On every authenticated request, our auth class updates last_activity (keeps them logged in).
+  - Mongo automatically deletes (logs out) tokens with no activity for 10 days (TTL on tokens.last_activity).
+
+- Logout:
+  - Delete current token (logout only this device)
+  - Or delete all tokens (logout from all devices)
+
+- Forgot password:
+  - Verified user requests OTP (cooldown 2 minutes, expires 10 minutes).
+  - They verify OTP and provide a new password in the same call.
+  - If correct, we delete the OTP, set the new password, and force logout from all devices by deleting tokens.
+
+- Delete account:
+  - Move user doc from users to deleted_users (so we can restore if needed).
+  - Delete all tokens.
+
+- Admin:
+  - Can restore a deleted user (unless someone else took their username/email/phone).
+  - Can blacklist/unblacklist users. Blacklisting logs them out immediately and blocks login.
+
+----------------------------------------
+Try it (example curl)
+----------------------------------------
+- Signup:
+  - curl -X POST http://localhost:8000/api/auth/signup -H "Content-Type: application/json" -d '{"username":"alice","email":"alice@example.com","phone":"1234567890","full_name":"Alice Liddell","role":"user","password":"TopSecret123","confirm_password":"TopSecret123"}'
+
+- Verify OTP:
+  - curl -X POST http://localhost:8000/api/auth/signup/verify-otp -H "Content-Type: application/json" -d '{"identifier":"alice","otp":"123456"}'
+
+- Login:
+  - curl -X POST http://localhost:8000/api/auth/login -H "Content-Type: application/json" -d '{"identifier":"alice","password":"TopSecret123"}'
+  - Response includes "token": use it like:
+  - curl http://localhost:8000/api/me -H "Authorization: Bearer YOUR_TOKEN"
+
+- Logout:
+  - curl -X POST http://localhost:8000/api/auth/logout -H "Authorization: Bearer YOUR_TOKEN"
+
+- Forgot password (request OTP):
+  - curl -X POST http://localhost:8000/api/auth/forgot-password/request-otp -H "Content-Type: application/json" -d '{"identifier":"alice"}'
+
+- Forgot password (verify and reset):
+  - curl -X POST http://localhost:8000/api/auth/forgot-password/verify-and-reset -H "Content-Type: application/json" -d '{"identifier":"alice","otp":"123456","new_password":"NewPass123","confirm_password":"NewPass123"}'
+
+- Delete self:
+  - curl -X DELETE http://localhost:8000/api/user -H "Authorization: Bearer YOUR_TOKEN"
+
+- Admin blacklist:
+  - curl -X POST http://localhost:8000/api/admin/users/blacklist -H "Authorization: Bearer ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"identifier":"alice","reason":"spam"}'
+
+----------------------------------------
+Security and production notes
+----------------------------------------
+- Always use HTTPS in production so tokens/OTPs aren’t sniffed
+- Replace send_email/send_sms with real providers and DO NOT log OTPs
+- Keep SECRET_KEY secret
+- Consider rate-limiting endpoints (e.g., django-ratelimit) to stop abuse
+- Validate phone numbers (e.g., with python-phonenumbers) if you rely on SMS
+- Backups: TTL deletes docs automatically; ensure that’s your intended behavior
+
+Totally. Here’s a simple “map” of every file/folder and what it does, who uses it, and when it runs.
+
+Project layout (big picture)
+- manage.py
+  - What: Command-line helper to run the Django project.
+  - You use it to: runserver, migrate, create superuser, etc.
+
+- core/ (project package)
+  - core/settings.py
+    - What: All settings (installed apps, MySQL, Mongo env vars, DRF auth, OTP timers).
+    - Important bits you’ll edit:
+      - REST_FRAMEWORK DEFAULT_AUTHENTICATION_CLASSES -> our Mongo token auth.
+      - MySQL settings for Django internal stuff (migrations, admin).
+      - MONGO_URI and MONGO_DB_NAME (your app data).
+      - OTP and security timings: OTP_TTL_SECONDS, OTP_COOLDOWN_SECONDS, TOKEN_INACTIVITY_TTL_SECONDS, LOGIN_LOCK_MINUTES, MAX_FAILED_LOGINS.
+  - core/urls.py
+    - What: Routes “/api/...” to your accounts app URLs and “/admin/” to Django admin.
+  - core/wsgi.py and core/asgi.py
+    - What: Entry points when you deploy on a WSGI/ASGI server.
+    - You don’t touch these for normal API work.
+
+- accounts/ (your API app)
+  - apps.py
+    - What: Runs when Django starts.
+    - It calls ensure_mongo_indexes() so all Mongo unique/TTL indexes are created automatically.
+  - urls.py
+    - What: Maps endpoint paths like /api/auth/signup to the matching view class.
+  - views.py
+    - What: All your API endpoints live here (DRF APIViews).
+    - Who calls it: The URLs point here. Each view:
+      - reads request data
+      - validates with serializer
+      - uses repositories to talk to Mongo
+      - returns a Response
+    - Endpoints inside:
+      - SignupView: POST /api/auth/signup
+      - ResendSignupOtpView: POST /api/auth/signup/resend-otp
+      - VerifySignupOtpView: POST /api/auth/signup/verify-otp
+      - LoginView: POST /api/auth/login
+      - LogoutView: POST /api/auth/logout
+      - LogoutAllView: POST /api/auth/logout-all
+      - ForgotPasswordRequestOtpView: POST /api/auth/forgot-password/request-otp
+      - VerifyOtpAndResetPasswordView: POST /api/auth/forgot-password/verify-and-reset
+      - DeleteAccountView: DELETE /api/user
+      - AdminRestoreUserView: POST /api/admin/users/restore
+      - AdminBlacklistUserView: POST /api/admin/users/blacklist
+      - AdminUnblacklistUserView: POST /api/admin/users/unblacklist
+      - MeView: GET /api/me
+  - serializers.py
+    - What: DRF serializers that validate request data before your view uses it.
+    - Examples:
+      - SignupSerializer: checks passwords match, required fields, lengths.
+      - LoginSerializer: takes identifier (username/email/phone) + password.
+      - VerifyOtpSerializer: takes identifier + otp for signup verification.
+      - ResetPasswordWithOtpSerializer: takes identifier + otp + new password.
+  - authentication.py
+    - What: Custom DRF auth class (MongoTokenAuthentication).
+    - How it works:
+      - Reads Authorization: Bearer <token>
+      - Looks up the token in Mongo (tokens collection)
+      - Finds the user in Mongo (users collection)
+      - Checks verified and not blacklisted
+      - Updates last_activity so token doesn’t auto-expire
+      - Attaches request.user and request.auth for the view
+  - repositories.py
+    - What: The only place that talks to MongoDB directly (CRUD).
+    - Why: Keeps views simple and all DB logic in one spot.
+    - Sections inside:
+      - Users:
+        - create_user: makes a new unverified user with delete_at (so Mongo auto-deletes in 10 min if not verified).
+        - find_user_by_identifier: login by username/email/phone.
+        - mark_user_verified: sets is_verified + removes delete_at (so user won’t be auto-deleted).
+        - increment_failed_logins / set_user_lock / reset_failed_logins: login attempts + lockout.
+        - update_password: change password (hashes it).
+        - set_blacklist: admin blacklist/unblacklist.
+        - move_user_to_deleted / restore_deleted_user_by_identifier: soft delete and restore.
+        - refresh_unverified_delete_timer: extend the 10 min window on resend OTP.
+      - OTPs:
+        - get_user_otp, create_or_replace_otp, delete_user_otp.
+        - OTPs are hashed (not stored in plain text) and auto-deleted by TTL in Mongo.
+      - Tokens:
+        - create_token, update_token_last_activity, find_token, delete_token, delete_all_tokens_for_user.
+        - Tokens auto-delete (auto-logout) after X days of inactivity via Mongo TTL.
+  - mongo.py
+    - What: Creates a single MongoDB client and exposes collection handles.
+    - Collections used:
+      - users_col (users)
+      - otps_col (otps)
+      - tokens_col (tokens)
+      - deleted_users_col (deleted_users)
+  - indexes.py
+    - What: Creates indexes in MongoDB:
+      - Unique indexes on users: username, email, phone.
+      - TTL index on users.delete_at to auto-delete unverified users after 10 min.
+      - Unique index on (user_id, otp_type) so 1 OTP per user per type.
+      - TTL index on otps.created_at so OTPs vanish after 10 min.
+      - TTL index on tokens.last_activity for auto-logout after inactivity (e.g., 10 days).
+    - Called automatically by apps.py at startup.
+  - utils/
+    - security.py
+      - hash_password / verify_password: uses Django’s secure hashing.
+      - generate_token: creates random login tokens.
+      - hash_otp + constant_time_compare: store/compare OTPs securely.
+    - otp.py
+      - generate_otp: makes a numeric OTP like “123456”.
+    - senders.py
+      - send_email / send_sms: placeholders (print). Replace with real providers (SendGrid/Twilio) later.
+
+Other important files
+- .env
+  - What: Your secrets and config (never commit to git).
+  - Contains things like SECRET_KEY, DB credentials, MONGO_URI, OTP settings, TTL times.
+- requirements.txt (optional but recommended)
+  - Put your package versions here (django, djangorestframework, pymongo, python-dotenv, mysqlclient).
+- README.md (optional)
+  - Human-friendly docs. I can generate one for you from this overview.
+
+How everything works together (quick flow)
+- Server start
+  - Django loads settings.py.
+  - accounts/apps.py runs -> ensure_mongo_indexes() creates all unique/TTL indexes.
+- When you hit an endpoint
+  - core/urls.py -> accounts/urls.py -> a view in views.py.
+  - If endpoint needs auth: authentication.py checks the token and user, refreshes last_activity.
+  - View uses serializers.py to validate input.
+  - View calls repositories.py to read/write Mongo.
+  - Utils handle hashing, OTP generation, sending messages.
+  - Response goes back to the client.
+
+Where to change behavior (common tweaks)
+- OTP length/time: settings.py (OTP_LENGTH, OTP_TTL_SECONDS).
+- OTP resend cooldown: settings.py (OTP_COOLDOWN_SECONDS).
+- Auto-logout inactivity window: settings.py (TOKEN_INACTIVITY_TTL_SECONDS).
+- Login lockout rules: settings.py (MAX_FAILED_LOGINS, LOGIN_LOCK_MINUTES).
+- Email/SMS provider: replace utils/senders.py with your real integrations.
+- Unique fields: indexes.py (username/email/phone uniqueness), plus create_user fields.
+
+Endpoints quick map (URL -> view -> what it does)
+- POST /api/auth/signup -> SignupView -> create unverified user + send signup OTP.
+- POST /api/auth/signup/resend-otp -> ResendSignupOtpView -> new OTP after 2 min; old OTP deleted.
+- POST /api/auth/signup/verify-otp -> VerifySignupOtpView -> verify OTP; user becomes verified.
+- POST /api/auth/login -> LoginView -> returns Bearer token; handles lockouts.
+- POST /api/auth/logout -> LogoutView -> deletes current token.
+- POST /api/auth/logout-all -> LogoutAllView -> deletes all tokens for user.
+- POST /api/auth/forgot-password/request-otp -> ForgotPasswordRequestOtpView -> sends password reset OTP.
+- POST /api/auth/forgot-password/verify-and-reset -> VerifyOtpAndResetPasswordView -> verifies OTP, sets new password, logs out everywhere.
+- DELETE /api/user -> DeleteAccountView -> soft deletes user (moves to deleted_users).
+- POST /api/admin/users/blacklist -> AdminBlacklistUserView -> blacklist + force logout (admin only).
+- POST /api/admin/users/unblacklist -> AdminUnblacklistUserView -> remove blacklist (admin only).
+- POST /api/admin/users/restore -> AdminRestoreUserView -> restore from deleted_users (admin only).
+- GET /api/me -> MeView -> returns your profile (needs Bearer token).
+
+Want me to generate a README.md for your repo with this exact explanation (and a tidy folder tree) so you can keep it with your code?
