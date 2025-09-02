@@ -5,6 +5,8 @@ import { viteSourceLocator } from "@metagptx/vite-plugin-source-locator";
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => ({
+  // Base path for GitHub Pages site at https://Nitish265.github.io/Django-Auth/
+  base: '/Django-Auth/',
   plugins: [
     viteSourceLocator({
       prefix: "mgx",
